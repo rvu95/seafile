@@ -92,6 +92,10 @@ struct _SeafRepo {
     /* Can be server_url or server_url:8082, depends on which one works. */
     char *effective_host;
     gboolean use_fileserver_port;
+
+    /* Detected file change set during indexing.
+     * Added to here to avoid passing additional arguments. */
+    GList **changeset;
 };
 
 

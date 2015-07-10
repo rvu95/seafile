@@ -749,17 +749,21 @@ void remove_marked_cache_entries(struct index_state *istate)
 {
     struct cache_entry **ce_array = istate->cache;
     unsigned int i, j;
+    gboolean removed = FALSE;
 
     for (i = j = 0; i < istate->cache_nr; i++) {
         if (ce_array[i]->ce_flags & CE_REMOVE) {
             remove_name_hash(istate, ce_array[i]);
             cache_entry_free (ce_array[i]);
+            removed = TRUE;
         } else {
             ce_array[j++] = ce_array[i];
         }
     }
-    istate->cache_changed = 1;
-    istate->cache_nr = j;
+    if (removed) {
+        istate->cache_changed = 1;
+        istate->cache_nr = j;
+    }
 }
 
 int remove_file_from_index(struct index_state *istate, const char *path)
@@ -1176,7 +1180,7 @@ add_empty_dir_to_index (struct index_state *istate, const char *path, SeafStat *
         return -1;
     }
 
-    return 0;
+    return 1;
 }
 
 int
