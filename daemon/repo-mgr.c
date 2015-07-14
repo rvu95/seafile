@@ -29,6 +29,7 @@
 #include "index/cache-tree.h"
 #include "unpack-trees.h"
 #include "diff-simple.h"
+#include "change-set.h"
 
 #include "db.h"
 
@@ -993,21 +994,11 @@ index_cb (const char *repo_id,
     return 0;
 }
 
-static void
-add_to_changeset (GList **changeset, char status, const char *name)
-{
-    DiffEntry *de;
-    unsigned char allzero[20] = {0};
-
-    de = diff_entry_new (DIFF_TYPE_INDEX, status, allzero, name);
-    *changeset = g_list_prepend (*changeset, de);
-}
-
 #define MAX_COMMIT_SIZE 100 * (1 << 20) /* 100MB */
 
 typedef struct _AddOptions {
     LockedFileSet *fset;
-    GList **changeset;
+    ChangeSet *changeset;
     gboolean is_repo_ro;
     gboolean startup_scan;
 } AddOptions;
@@ -1037,11 +1028,10 @@ add_file (const char *repo_id,
     is_locked = seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
                                                       repo_id, path);
 
-    ce = index_name_exists (istate, path, strlen(path), 0);
-
     if (options && options->startup_scan) {
         SyncStatus status;
 
+        ce = index_name_exists (istate, path, strlen(path), 0);
         if (!ce || ie_match_stat(ce, st, 0) != 0)
             status = SYNC_STATUS_SYNCING;
         else
@@ -1090,10 +1080,16 @@ add_file (const char *repo_id,
                                                   SYNC_STATUS_SYNCED);
         }
         if (added && options && options->changeset) {
-            if (ce)
-                add_to_changeset (options->changeset, DIFF_STATUS_MODIFIED, path);
-            else
-                add_to_changeset (options->changeset, DIFF_STATUS_ADDED, path);
+            /* ce may be updated. */
+            ce = index_name_exists (istate, path, strlen(path), 0);
+            add_to_changeset (options->changeset,
+                              DIFF_STATUS_ADDED,
+                              ce->sha1,
+                              st,
+                              modifier,
+                              path,
+                              NULL,
+                              TRUE);
         }
     } else if (*remain_files == NULL) {
         ret = add_to_index (repo_id, version, istate, path, full_path,
@@ -1110,10 +1106,16 @@ add_file (const char *repo_id,
                                                   SYNC_STATUS_SYNCED);
         }
         if (added && options && options->changeset) {
-            if (ce)
-                add_to_changeset (options->changeset, DIFF_STATUS_MODIFIED, path);
-            else
-                add_to_changeset (options->changeset, DIFF_STATUS_ADDED, path);
+            /* ce may be updated. */
+            ce = index_name_exists (istate, path, strlen(path), 0);
+            add_to_changeset (options->changeset,
+                              DIFF_STATUS_ADDED,
+                              ce->sha1,
+                              st,
+                              modifier,
+                              path,
+                              NULL,
+                              TRUE);
         }
     } else
         g_queue_push_tail (*remain_files, g_strdup(path));
@@ -1252,8 +1254,17 @@ add_dir_recursive (const char *path, const char *full_path, SeafStat *st,
     if (n == 0 && path[0] != 0 && is_writable) {
         if (!params->remain_files || *(params->remain_files) == NULL) {
             int rc = add_empty_dir_to_index (params->istate, path, st);
-            if (rc == 1 && options && options->changeset)
-                add_to_changeset (options->changeset, DIFF_STATUS_DIR_ADDED, path);
+            if (rc == 1 && options && options->changeset) {
+                unsigned char allzero[20] = {0};
+                add_to_changeset (options->changeset,
+                                  DIFF_STATUS_DIR_ADDED,
+                                  allzero,
+                                  st,
+                                  NULL,
+                                  path,
+                                  NULL,
+                                  TRUE);
+            }
         } else
             g_queue_push_tail (*(params->remain_files), g_strdup(path));
     }
@@ -1491,8 +1502,17 @@ add_dir_recursive (const char *path, const char *full_path, SeafStat *st,
     if (data.n == 0 && path[0] != 0 && !params->ignore_empty_dir && is_writable) {
         if (!params->remain_files || *(params->remain_files) == NULL) {
             int rc = add_empty_dir_to_index (params->istate, path, st);
-            if (rc == 1 && options && options->changeset)
-                add_to_changeset (options->changeset, DIFF_STATUS_DIR_ADDED, path);
+            if (rc == 1 && options && options->changeset) {
+                unsigned char allzero[20] = {0};
+                add_to_changeset (options->changeset,
+                                  DIFF_STATUS_DIR_ADDED,
+                                  allzero,
+                                  st,
+                                  NULL,
+                                  path,
+                                  NULL,
+                                  TRUE);
+            }
         } else
             g_queue_push_tail (*(params->remain_files), g_strdup(path));
     }
@@ -1648,7 +1668,7 @@ static void
 remove_deleted (struct index_state *istate, const char *worktree, const char *prefix,
                 GList *ignore_list, LockedFileSet *fset,
                 const char *repo_id, gboolean is_repo_ro,
-                GList **changeset)
+                ChangeSet *changeset)
 {
     struct cache_entry **ce_array = istate->cache;
     struct cache_entry *ce;
@@ -1678,13 +1698,23 @@ remove_deleted (struct index_state *istate, const char *worktree, const char *pr
             not_exist = TRUE;
 
         if (S_ISDIR (ce->ce_mode)) {
-            if ((not_exist || (ret == 0 && !S_ISDIR (st.st_mode))
-                 || !is_empty_dir (path, ignore_list)) &&
-                (ce->ce_ctime.sec != 0 || ce_stage(ce) != 0))
-            {
-                ce->ce_flags |= CE_REMOVE;
-                if (changeset)
-                    add_to_changeset (changeset, DIFF_STATUS_DIR_DELETED, ce->name);
+            if (ce->ce_ctime.sec != 0 || ce_stage(ce) != 0) {
+                if (not_exist || (ret == 0 && !S_ISDIR (st.st_mode))) {
+                    /* Add to changeset only if dir is removed. */
+                    ce->ce_flags |= CE_REMOVE;
+                    if (changeset)
+                        add_to_changeset (changeset,
+                                          DIFF_STATUS_DIR_DELETED,
+                                          NULL,
+                                          NULL,
+                                          NULL,
+                                          ce->name,
+                                          NULL,
+                                          TRUE);
+                } else if (!is_empty_dir (path, ignore_list)) {
+                    /* Don't add to changeset if empty dir became non-empty. */
+                    ce->ce_flags |= CE_REMOVE;
+                }
             }
         } else {
             /* If ce->ctime is 0 and stage is 0, it was not successfully checked out.
@@ -1697,7 +1727,14 @@ remove_deleted (struct index_state *istate, const char *worktree, const char *pr
             {
                 ce_array[i]->ce_flags |= CE_REMOVE;
                 if (changeset)
-                    add_to_changeset (changeset, DIFF_STATUS_DELETED, ce->name);
+                    add_to_changeset (changeset,
+                                      DIFF_STATUS_DELETED,
+                                      NULL,
+                                      NULL,
+                                      NULL,
+                                      ce->name,
+                                      NULL,
+                                      TRUE);
             }
         }
     }
@@ -1949,16 +1986,29 @@ add_remain_files (SeafRepo *repo, struct index_state *istate,
 
             if (added) {
                 ce = index_name_exists (istate, path, strlen(path), 0);
-                if (ce)
-                    add_to_changeset (repo->changeset, DIFF_STATUS_MODIFIED, path);
-                else
-                    add_to_changeset (repo->changeset, DIFF_STATUS_ADDED, path);
+                add_to_changeset (repo->changeset,
+                                  DIFF_STATUS_ADDED,
+                                  ce->sha1,
+                                  &st,
+                                  repo->email,
+                                  path,
+                                  NULL,
+                                  TRUE);
             }
         } else if (S_ISDIR(st.st_mode)) {
             if (is_empty_dir (full_path, ignore_list)) {
                 int rc = add_empty_dir_to_index (istate, path, &st);
-                if (rc == 1)
-                    add_to_changeset (repo->changeset, DIFF_STATUS_DIR_ADDED, path);
+                if (rc == 1) {
+                    unsigned char allzero[20] = {0};
+                    add_to_changeset (repo->changeset,
+                                      DIFF_STATUS_DIR_ADDED,
+                                      allzero,
+                                      &st,
+                                      NULL,
+                                      path,
+                                      NULL,
+                                      TRUE);
+                }
             }
         }
         g_free (path);
@@ -2076,7 +2126,6 @@ update_ce_mode (struct index_state *istate, const char *worktree, const char *pa
     unsigned int new_mode = create_ce_mode (st.st_mode);
     if (new_mode != ce->ce_mode)
         ce->ce_mode = new_mode;
-    istate->cache_changed = 1;
 }
 
 #ifdef WIN32
@@ -2089,7 +2138,7 @@ scan_subtree_for_deletion (const char *repo_id,
                            LockedFileSet *fset,
                            gboolean is_readonly,
                            GList **scanned_dirs,
-                           GList **changeset)
+                           ChangeSet *changeset)
 {
     wchar_t *path_w;
     wchar_t *dir_w = NULL;
@@ -2175,7 +2224,7 @@ scan_subtree_for_deletion (const char *repo_id,
                            LockedFileSet *fset,
                            gboolean is_readonly,
                            GList **scanned_dirs,
-                           GList **changeset)
+                           ChangeSet *changeset)
 {
 }
 #endif
@@ -2783,7 +2832,16 @@ handle_rename (SeafRepo *repo, struct index_state *istate,
                                            ignore_list, fset,
                                            repo->is_readonly,
                                            scanned_del_dirs,
-                                           NULL);
+                                           repo->changeset);
+
+            add_to_changeset (repo->changeset,
+                              DIFF_STATUS_DELETED,
+                              NULL,
+                              NULL,
+                              NULL,
+                              event->path,
+                              NULL,
+                              FALSE);
         }
         return;
     }
@@ -2799,7 +2857,7 @@ handle_rename (SeafRepo *repo, struct index_state *istate,
                                        ignore_list, fset,
                                        repo->is_readonly,
                                        scanned_del_dirs,
-                                       NULL);
+                                       repo->changeset);
 
         /* Moving files out of a dir may make it empty. */
         try_add_empty_parent_dir_entry_from_wt (repo->worktree,
@@ -2807,6 +2865,16 @@ handle_rename (SeafRepo *repo, struct index_state *istate,
                                                 ignore_list,
                                                 event->path);
     }
+
+    if (!dst_ignored && !src_ignored)
+        add_to_changeset (repo->changeset,
+                          DIFF_STATUS_RENAMED,
+                          NULL,
+                          NULL,
+                          NULL,
+                          event->path,
+                          event->new_path,
+                          TRUE);
 
     AddOptions options;
     memset (&options, 0, sizeof(options));
@@ -2827,13 +2895,6 @@ handle_rename (SeafRepo *repo, struct index_state *istate,
                    istate, repo->worktree, event->new_path,
                    crypt, FALSE, ignore_list,
                    NULL, NULL, &options);
-
-    /* Only add rename operation to changeset when both src and dst are
-     * not ignored. Modified or create operation may be added on the
-     * above add_recursive() call too.
-     */
-    if (!dst_ignored && !src_ignored)
-        add_to_changeset (repo->changeset, DIFF_STATUS_RENAMED, event->path);
 }
 
 static int
@@ -2937,8 +2998,15 @@ apply_worktree_changes_to_index (SeafRepo *repo, struct index_state *istate,
                                                repo->is_readonly,
                                                &scanned_del_dirs,
                                                repo->changeset);
-                else
-                    add_to_changeset (repo->changeset, DIFF_STATUS_DELETED, event->path);
+
+                add_to_changeset (repo->changeset,
+                                  DIFF_STATUS_DELETED,
+                                  NULL,
+                                  NULL,
+                                  NULL,
+                                  event->path,
+                                  NULL,
+                                  TRUE);
 
                 try_add_empty_parent_dir_entry_from_wt (repo->worktree,
                                                         istate,
@@ -3332,14 +3400,11 @@ seaf_repo_is_index_unmerged (SeafRepo *repo)
 }
 
 static int
-commit_tree (SeafRepo *repo, struct cache_tree *it,
+commit_tree (SeafRepo *repo, const char *root_id,
              const char *desc, char commit_id[],
              gboolean unmerged)
 {
     SeafCommit *commit;
-    char root_id[41];
-
-    rawdata_to_hex (it->sha1, root_id, 20);
 
     commit = seaf_commit_new (NULL, repo->id, root_id,
                               repo->email ? repo->email
@@ -3430,11 +3495,11 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc, gboolean is_force_comm
 {
     SeafRepoManager *mgr = repo->manager;
     struct index_state istate;
-    struct cache_tree *it = NULL;
     char index_path[SEAF_PATH_MAX];
+    char *root_id = NULL;
     char commit_id[41];
     gboolean unmerged = FALSE;
-    GList *changeset = NULL;
+    ChangeSet *changeset = NULL;
     char *my_desc = NULL;
     char *ret = NULL;
 
@@ -3456,11 +3521,11 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc, gboolean is_force_comm
 
     g_get_current_time (&s);
 
-    repo->changeset = &changeset;
+    changeset = changeset_new (repo->id);
+    repo->changeset = changeset;
 
     if (index_add (repo, &istate, is_force_commit, unmerged) < 0) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL, "Failed to add");
-        g_list_free_full (changeset, (GDestroyNotify)diff_entry_free);
         goto out;
     }
 
@@ -3472,7 +3537,7 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc, gboolean is_force_comm
 
     g_get_current_time (&s);
 
-    my_desc = diff_results_to_description (changeset);
+    my_desc = diff_results_to_description (changeset->diff);
     if (!my_desc)
         my_desc = g_strdup("");
 
@@ -3481,20 +3546,16 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc, gboolean is_force_comm
 
     g_get_current_time (&s);
 
-    it = cache_tree ();
-    if (cache_tree_update (repo->id, repo->version,
-                           repo->worktree,
-                           it, istate.cache,
-                           istate.cache_nr, 0, 0, commit_trees_cb) < 0) {
-        seaf_warning ("Failed to build cache tree");
-        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_INTERNAL, "Internal data structure error");
+    root_id = commit_tree_from_changeset (changeset);
+    if (!root_id) {
+        seaf_warning ("Create commit tree failed for repo %s\n", repo->id);
         goto out;
     }
 
     g_get_current_time (&e);
     print_time ("cache_tree_update", &s, &e);
 
-    if (commit_tree (repo, it, my_desc, commit_id, unmerged) < 0) {
+    if (commit_tree (repo, root_id, my_desc, commit_id, unmerged) < 0) {
         seaf_warning ("Failed to save commit file");
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_INTERNAL, "Internal error");
         goto out;
@@ -3509,9 +3570,8 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc, gboolean is_force_comm
 
 out:
     g_free (my_desc);
-    if (it)
-        cache_tree_free (&it);
-    g_list_free_full (changeset, (GDestroyNotify)diff_entry_free);
+    g_free (root_id);
+    changeset_free (changeset);
     discard_index (&istate);
     return ret;
 }

@@ -33,6 +33,8 @@
 struct _SeafRepoManager;
 typedef struct _SeafRepo SeafRepo;
 
+struct _ChangeSet;
+
 /* The caller can use the properties directly. But the caller should
  * always write on repos via the API. 
  */
@@ -95,7 +97,7 @@ struct _SeafRepo {
 
     /* Detected file change set during indexing.
      * Added to here to avoid passing additional arguments. */
-    GList **changeset;
+    struct _ChangeSet *changeset;
 };
 
 

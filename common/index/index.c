@@ -524,8 +524,8 @@ static int ce_match_stat_basic(struct cache_entry *ce, SeafStat *st)
     }
     if (ce->ce_mtime.sec != st->st_mtime)
         changed |= MTIME_CHANGED;
-    if (ce->ce_ctime.sec != st->st_ctime)
-        changed |= CTIME_CHANGED;
+    /* if (ce->ce_ctime.sec != st->st_ctime) */
+    /*     changed |= CTIME_CHANGED; */
 
 #if 0
     if (ce->ce_uid != (unsigned int) st->st_uid ||
