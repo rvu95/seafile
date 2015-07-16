@@ -1964,9 +1964,26 @@ seafile_list_owned_repos (const char *email, GError **error)
 {
     GList *ret = NULL;
     GList *repos, *ptr;
+    char *repo_id = NULL;
+    int is_shared;
 
     repos = seaf_repo_manager_get_repos_by_owner (seaf->repo_mgr, email);
     ret = convert_repo_list (repos);
+
+    for (ptr = ret; ptr; ptr = ptr->next) {
+        g_object_get (ptr->data, "repo_id", &repo_id, NULL);
+        is_shared = seaf_share_manager_is_repo_shared (seaf->share_mgr, repo_id);
+        if (is_shared < 0) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_INTERNAL,
+                         "Failed get repo shared status from db.");
+            while (ret) {
+                g_object_unref (ret->data);
+                ret = g_list_delete_link (ret, ret);
+            }
+            break;
+        }
+        g_object_set (ptr->data, "is_shared", is_shared, NULL);
+    }
 
     for(ptr = repos; ptr; ptr = ptr->next) {
         seaf_repo_unref ((SeafRepo *)ptr->data);

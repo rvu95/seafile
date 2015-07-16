@@ -100,15 +100,21 @@ check_virtual_repo_permission (SeafRepoManager *mgr,
                                const char *repo_id,
                                const char *origin_repo_id,
                                const char *user,
+                               gboolean *is_owner,
                                GError **error)
 {
     char *owner = NULL;
     char *permission = NULL;
 
+    if (is_owner)
+        *is_owner = FALSE;
+
     /* If I'm the owner of origin repo, I have full access to sub-repos. */
     owner = seaf_repo_manager_get_repo_owner (mgr, origin_repo_id);
     if (g_strcmp0 (user, owner) == 0) {
         permission = g_strdup("rw");
+        if (is_owner)
+            *is_owner = TRUE;
         return permission;
     }
     g_free (owner);
@@ -125,6 +131,45 @@ check_virtual_repo_permission (SeafRepoManager *mgr,
     return permission;
 }
 
+static char *
+check_permission_and_owner (SeafRepoManager *mgr,
+                            const char *repo_id,
+                            const char *user,
+                            gboolean *is_owner,
+                            GError **error)
+{
+    SeafVirtRepo *vinfo;
+    char *owner = NULL;
+    char *permission = NULL;
+
+    if (is_owner)
+        *is_owner = FALSE;
+
+    /* This is a virtual repo.*/
+    vinfo = seaf_repo_manager_get_virtual_repo_info (mgr, repo_id);
+    if (vinfo) {
+        permission = check_virtual_repo_permission (mgr, repo_id,
+                                                    vinfo->origin_repo_id,
+                                                    user, is_owner, error);
+        goto out;
+    }
+
+    owner = seaf_repo_manager_get_repo_owner (mgr, repo_id);
+    if (owner != NULL) {
+        if (strcmp (owner, user) == 0) {
+            permission = g_strdup("rw");
+            if (is_owner)
+                *is_owner = TRUE;
+        } else
+            permission = check_repo_share_permission (mgr, repo_id, user);
+    }
+
+out:
+    seaf_virtual_repo_info_free (vinfo);
+    g_free (owner);
+    return permission;
+}
+
 /*
  * Comprehensive repo access permission checker.
  *
@@ -136,31 +181,7 @@ seaf_repo_manager_check_permission (SeafRepoManager *mgr,
                                     const char *user,
                                     GError **error)
 {
-    SeafVirtRepo *vinfo;
-    char *owner = NULL;
-    char *permission = NULL;
-
-    /* This is a virtual repo.*/
-    vinfo = seaf_repo_manager_get_virtual_repo_info (mgr, repo_id);
-    if (vinfo) {
-        permission = check_virtual_repo_permission (mgr, repo_id,
-                                                    vinfo->origin_repo_id,
-                                                    user, error);
-        goto out;
-    }
-
-    owner = seaf_repo_manager_get_repo_owner (mgr, repo_id);
-    if (owner != NULL) {
-        if (strcmp (owner, user) == 0)
-            permission = g_strdup("rw");
-        else
-            permission = check_repo_share_permission (mgr, repo_id, user);
-    }
-
-out:
-    seaf_virtual_repo_info_free (vinfo);
-    g_free (owner);
-    return permission;
+    return check_permission_and_owner (mgr, repo_id, user, NULL, error);
 }
 
 /*
@@ -180,6 +201,34 @@ comp_dirent_func (gconstpointer a, gconstpointer b)
     return strcasecmp (dent_a->name, dent_b->name);
 }
 
+static char *
+format_dir_path (SeafRepo *repo, const char *path)
+{
+    char *dpath;
+
+    if (path[0] != '/') {
+        dpath = g_strconcat ("/", path, NULL);
+    } else {
+        dpath = g_strdup (path);
+    }
+
+    char *rpath;
+    if (repo->virtual_info) {
+        rpath = g_strconcat(repo->virtual_info->path, dpath, NULL);
+        g_free (dpath);
+    } else {
+        rpath = dpath;
+    }
+
+    int plen = strlen (rpath) - 1;
+    while (plen >= 0 && rpath[plen] == '/') {
+        rpath[plen] = '\0';
+        plen--;
+    }
+
+    return rpath;
+}
+
 GList *
 seaf_repo_manager_list_dir_with_perm (SeafRepoManager *mgr,
                                       const char *repo_id,
@@ -197,13 +246,14 @@ seaf_repo_manager_list_dir_with_perm (SeafRepoManager *mgr,
     SeafileDirent *d;
     GList *res = NULL;
     GList *p;
+    gboolean is_owner = FALSE;
 
     if (!repo_id || !is_uuid_valid(repo_id) || dir_id == NULL || !user) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_DIR_ID, "Bad dir id");
         return NULL;
     }
 
-    perm = seaf_repo_manager_check_permission (mgr, repo_id, user, error);
+    perm = check_permission_and_owner (mgr, repo_id, user, &is_owner, error);
     if (!perm) {
         if (*error == NULL)
             g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Access denied");
@@ -233,6 +283,11 @@ seaf_repo_manager_list_dir_with_perm (SeafRepoManager *mgr,
     }
 
     int index = 0;
+    gboolean is_shared;
+    char *pdir = NULL;
+    char *cur_path;
+    GHashTable *shared_sub_dirs = NULL;
+
     for (p = dir->entries; p != NULL; p = p->next, index++) {
         if (index < offset) {
             continue;
@@ -253,12 +308,40 @@ seaf_repo_manager_list_dir_with_perm (SeafRepoManager *mgr,
                           "size", dent->size,
                           "permission", perm,
                           NULL);
+
+        if (is_owner && S_ISDIR(dent->mode)) {
+            if (!shared_sub_dirs) {
+                pdir = format_dir_path (repo, dir_path);
+                shared_sub_dirs = seaf_share_manager_get_shared_sub_dirs (seaf->share_mgr,
+                                                                          repo->store_id,
+                                                                          pdir);
+                if (!shared_sub_dirs) {
+                    g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_INTERNAL,
+                                 "Failed to get shared sub dirs from db.");
+                    while (res) {
+                        g_object_unref (res->data);
+                        res = g_list_delete_link (res, res);
+                    }
+                    break;
+                }
+            }
+            cur_path = g_strconcat (pdir, "/", dent->name, NULL);
+            is_shared = g_hash_table_lookup (shared_sub_dirs, cur_path) ? TRUE : FALSE;
+            g_free (cur_path);
+            g_object_set (d, "is_shared", is_shared, NULL);
+        }
         res = g_list_prepend (res, d);
     }
 
+    if (shared_sub_dirs)
+        g_hash_table_destroy (shared_sub_dirs);
+    if (pdir)
+        g_free (pdir);
     seaf_dir_free (dir);
     seaf_repo_unref (repo);
     g_free (perm);
-    res = g_list_reverse (res);
+    if (res)
+        res = g_list_reverse (res);
+
     return res;
 }
