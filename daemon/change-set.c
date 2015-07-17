@@ -17,6 +17,11 @@ struct _ChangeSetDir {
     char dir_id[41];
     /* A hash table of dirents for fast lookup and insertion. */
     GHashTable *dents;
+#if defined WIN32 || defined __APPLE__
+    /* Case-insensitive hash table. */
+    GHashTable *dents_i;
+#endif
+
 };
 typedef struct _ChangeSetDir ChangeSetDir;
 
@@ -85,12 +90,26 @@ changeset_dirent_free (ChangeSetDirent *dent)
 
 /* Change set dir. */
 
+static void
+add_dent_to_dir (ChangeSetDir *dir, ChangeSetDirent *dent)
+{
+    g_hash_table_insert (dir->dents,
+                         g_strdup(dent->name),
+                         dent);
+#if defined WIN32 || defined __APPLE__
+    g_hash_table_insert (dir->dents_i,
+                         g_utf8_strdown(dent->name, -1),
+                         dent);
+#endif
+}
+
 static ChangeSetDir *
 changeset_dir_new (int version, const char *id, GList *dirents)
 {
     ChangeSetDir *dir = g_new0 (ChangeSetDir, 1);
     GList *ptr;
     SeafDirent *dent;
+    ChangeSetDirent *changeset_dent;
 
     dir->version = version;
     if (id)
@@ -99,9 +118,8 @@ changeset_dir_new (int version, const char *id, GList *dirents)
                                         g_free, (GDestroyNotify)changeset_dirent_free);
     for (ptr = dirents; ptr; ptr = ptr->next) {
         dent = ptr->data;
-        g_hash_table_insert (dir->dents,
-                             g_strdup(dent->name),
-                             seaf_dirent_to_changeset_dirent(dent));
+        changeset_dent = seaf_dirent_to_changeset_dirent(dent);
+        add_dent_to_dir (dir, changeset_dent);
     }
 
     return dir;
@@ -245,9 +263,7 @@ create_new_dent (ChangeSetDir *dir,
     if (in_new_dent) {
         g_free (in_new_dent->name);
         in_new_dent->name = g_strdup(dname);
-        g_hash_table_insert (dir->dents,
-                             g_strdup(in_new_dent->name),
-                             in_new_dent);
+        add_dent_to_dir (dir, in_new_dent);
         return;
     }
 
@@ -257,7 +273,7 @@ create_new_dent (ChangeSetDir *dir,
     new_dent = changeset_dirent_new (id, create_ce_mode(st->st_mode), dname,
                                      st->st_mtime, modifier, st->st_size);
 
-    g_hash_table_insert (dir->dents, g_strdup(dname), new_dent);
+    add_dent_to_dir (dir, new_dent);
 }
 
 static ChangeSetDir *
@@ -267,7 +283,7 @@ create_intermediate_dir (ChangeSetDir *parent, const char *dname)
 
     dent = changeset_dirent_new (EMPTY_SHA1, S_IFDIR, dname, 0, NULL, 0);
     dent->subdir = changeset_dir_new (parent->version, EMPTY_SHA1, NULL);
-    g_hash_table_insert (parent->dents, g_strdup(dname), dent);
+    add_dent_to_dir (parent, dent);
 
     return dent->subdir;
 }
@@ -286,6 +302,7 @@ add_to_tree (const char *repo_id,
     ChangeSetDir *dir;
     ChangeSetDirent *dent;
     SeafDir *seaf_dir;
+    char *search_key, *key;
 
     seaf_message ("add_to_tree: %s\n", path);
 
@@ -322,6 +339,20 @@ add_to_tree (const char *repo_id,
             }
         } else {
             seaf_message ("%s not found\n", dname);
+
+#if defined WIN32 || defined __APPLE__
+            search_key = g_utf8_strdown (dname);
+            if (g_hash_table_lookup_extended (dir->dents_i, search_key,
+                                              (gpointer*)&key, (gpointer*)&dent)) {
+                seaf_message ("Replace %s with %s\n", dent->name, dname);
+                g_hash_table_steal (dir->dents_i, search_key);
+                g_hash_table_steal (dir->dents, dent->name);
+                g_free (dent->name);
+                dent->name = g_strdup(dname);
+                add_dent_to_dir (dir, dent);
+            }
+#endif
+
             if (i == (n-1)) {
                 create_new_dent (dir, dname, sha1, st, modifier, new_dent);
             } else {
