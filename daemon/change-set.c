@@ -103,6 +103,23 @@ add_dent_to_dir (ChangeSetDir *dir, ChangeSetDirent *dent)
 #endif
 }
 
+static void
+remove_dent_from_dir (ChangeSetDir *dir, const char *dname)
+{
+    char *key;
+
+    if (g_hash_table_lookup_extended (dir->dents, dname,
+                                      (gpointer*)&key, NULL)) {
+        g_hash_table_steal (dir->dents, dname);
+        g_free (key);
+    }
+#if defined WIN32 || defined __APPLE__
+    char *dname_i = g_utf8_strdown (dname, -1);
+    g_hash_table_remove (dir->dents_i, dname_i);
+    g_free (dname_i);
+#endif
+}
+
 static ChangeSetDir *
 changeset_dir_new (int version, const char *id, GList *dirents)
 {
@@ -116,6 +133,10 @@ changeset_dir_new (int version, const char *id, GList *dirents)
         memcpy (dir->dir_id, id, 40);
     dir->dents = g_hash_table_new_full (g_str_hash, g_str_equal,
                                         g_free, (GDestroyNotify)changeset_dirent_free);
+#if defined WIN32 || defined __APPLE__
+    dir->dents_i = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                          g_free, NULL);
+#endif
     for (ptr = dirents; ptr; ptr = ptr->next) {
         dent = ptr->data;
         changeset_dent = seaf_dirent_to_changeset_dirent(dent);
@@ -131,6 +152,9 @@ changeset_dir_free (ChangeSetDir *dir)
     if (!dir)
         return;
     g_hash_table_destroy (dir->dents);
+#if defined WIN32 || defined __APPLE__
+    g_hash_table_destroy (dir->dents_i);
+#endif
     g_free (dir);
 }
 
@@ -302,7 +326,7 @@ add_to_tree (const char *repo_id,
     ChangeSetDir *dir;
     ChangeSetDirent *dent;
     SeafDir *seaf_dir;
-    char *search_key, *key;
+    char *search_key;
 
     seaf_message ("add_to_tree: %s\n", path);
 
@@ -310,6 +334,7 @@ add_to_tree (const char *repo_id,
     n = g_strv_length(parts);
     dir = root;
     for (i = 0; i < n; i++) {
+    try_again:
         dname = parts[i];
         dent = g_hash_table_lookup (dir->dents, dname);
 
@@ -341,15 +366,22 @@ add_to_tree (const char *repo_id,
             seaf_message ("%s not found\n", dname);
 
 #if defined WIN32 || defined __APPLE__
-            search_key = g_utf8_strdown (dname);
-            if (g_hash_table_lookup_extended (dir->dents_i, search_key,
-                                              (gpointer*)&key, (gpointer*)&dent)) {
-                seaf_message ("Replace %s with %s\n", dent->name, dname);
-                g_hash_table_steal (dir->dents_i, search_key);
-                g_hash_table_steal (dir->dents, dent->name);
-                g_free (dent->name);
-                dent->name = g_strdup(dname);
-                add_dent_to_dir (dir, dent);
+            /* Only effective for add operation, not applicable to rename. */
+            if (!new_dent) {
+                search_key = g_utf8_strdown (dname, -1);
+                dent = g_hash_table_lookup (dir->dents_i, search_key);
+                g_free (search_key);
+                if (dent) {
+                    seaf_message ("Replace %s with %s\n", dent->name, dname);
+
+                    remove_dent_from_dir (dir, dent->name);
+
+                    g_free (dent->name);
+                    dent->name = g_strdup(dname);
+                    add_dent_to_dir (dir, dent);
+
+                    goto try_again;
+                }
             }
 #endif
 
@@ -374,7 +406,6 @@ delete_from_tree (const char *repo_id,
     ChangeSetDir *dir;
     ChangeSetDirent *dent, *ret = NULL;
     SeafDir *seaf_dir;
-    char *key;
 
     seaf_message ("delete_from_tree: %s\n", path);
 
@@ -384,8 +415,8 @@ delete_from_tree (const char *repo_id,
     for (i = 0; i < n; i++) {
         dname = parts[i];
 
-        if (!g_hash_table_lookup_extended (dir->dents, dname,
-                                           (gpointer*)&key, (gpointer*)&dent))
+        dent = g_hash_table_lookup (dir->dents, dname);
+        if (!dent)
             break;
 
         seaf_message ("%s\n", dname);
@@ -393,8 +424,7 @@ delete_from_tree (const char *repo_id,
         if (S_ISDIR(dent->mode)) {
             if (i == (n-1)) {
                 /* Remove from hash table without freeing dent. */
-                g_hash_table_steal (dir->dents, dname);
-                g_free (key);
+                remove_dent_from_dir (dir, dname);
                 ret = dent;
                 break;
             }
@@ -410,8 +440,7 @@ delete_from_tree (const char *repo_id,
         } else if (S_ISREG(dent->mode)) {
             if (i == (n-1)) {
                 /* Remove from hash table without freeing dent. */
-                g_hash_table_steal (dir->dents, dname);
-                g_free (key);
+                remove_dent_from_dir (dir, dname);
                 ret = dent;
                 break;
             }
